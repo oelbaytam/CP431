@@ -1,11 +1,10 @@
-cd /workspaces/CP431-A1
-rm -f .prime_gap_mpi.c.swp
-cat > prime_gap_mpi.c
+#include <stddef.h>
 #include <mpi.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
 
 typedef unsigned long long ull;
 
