@@ -1,239 +1,143 @@
-#include <stddef.h>
-#include <mpi.h>
+#include "mpi.h"
 #include <math.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+/* How does this code work:
+ * Biggest potential prime is n, the biggest possible factor of n is sqrt(n)
+ * Calculate all the primes up to sqrt(n) and call them "primes"
+ *
+*/
+#define SEGMENT_SIZE 1000000 // Just did 1 million but the theory is that if its small it fits within the CPU Cache
 
+int* simple_sieve(long sqrt_n, int *prime_count) { // Finds prime numbers up to sqrt(n) to use in the segmented sieve.
+    char *is_prime = (char *)malloc(sqrt_n + 1); // Create a character array of primes up to sqrt(n) + 1
+    memset(is_prime, 1, sqrt_n + 1); // Assume all characters are primes.
+    is_prime[0] = is_prime[1] = 0; // 0 and 1 wont be used to calculate other primes.
 
-typedef unsigned long long ull;
-
-// Sieve odd primes in [3..limit]. 2 handled separately.
-static uint32_t* simple_sieve_odd(uint32_t limit, int* count_out) {
-    uint8_t* is_comp = (uint8_t*)calloc((size_t)limit + 1, 1);
-    if (!is_comp) { fprintf(stderr, "alloc fail\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
-
-    uint32_t r = (uint32_t)floor(sqrt((double)limit));
-    for (uint32_t i = 3; i <= r; i += 2) {
-        if (!is_comp[i]) {
-            uint64_t step = (uint64_t)2 * i;
-            uint64_t start = (uint64_t)i * i;
-            for (uint64_t j = start; j <= limit; j += step) is_comp[(size_t)j] = 1;
+    for (long i = 2; i * i <= sqrt_n; i++) { // A simple seive from 2 to sqrt(n)
+        if (is_prime[i]) { // if a prime is found
+            for (long j = i * i; j <= sqrt_n; j += i) is_prime[j] = 0; // mark all multiples to sqrt(n) as non primes.
         }
     }
 
+    // calculate amount of primes to use in prime array definition
     int count = 0;
-    for (uint32_t i = 3; i <= limit; i += 2) if (!is_comp[i]) count++;
+    for (long i = 2; i <= sqrt_n; i++) if (is_prime[i]) count++;
 
-    uint32_t* primes = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
-    if (!primes) { fprintf(stderr, "alloc fail\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+    // define array of primes to use in each segment
+    int *primes = (int *)malloc(count * sizeof(int));
+    int index = 0;
+    for (long i = 2; i <= sqrt_n; i++) { // loop through all values from 2 to sqrt(n)
+        if (is_prime[i]) primes[index++] = (int)i; // if its a prime add it to primes[index]
+    }
 
-    int idx = 0;
-    for (uint32_t i = 3; i <= limit; i += 2) if (!is_comp[i]) primes[idx++] = i;
-
-    free(is_comp);
-    *count_out = count;
+    free(is_prime);
+    *prime_count = count;
     return primes;
 }
 
-// Bitset helpers
-static inline void bs_set(uint8_t* bits, uint64_t idx) { bits[idx >> 3] |= (uint8_t)(1u << (idx & 7u)); }
-static inline int  bs_get(const uint8_t* bits, uint64_t idx) { return (bits[idx >> 3] >> (idx & 7u)) & 1u; }
+// --- FUNCTION: Sieve a specific segment and update gap statistics ---
+void sieve_segment(long seg_low, long seg_high, int *primes, int prime_count,
+                   long *local_max, long *prev_p, long *first_p, long *last_p) {
 
-static void sieve_window_and_update(
-    uint64_t low, uint64_t high,
-    const uint32_t* base, int base_count,
-    uint64_t* local_first, uint64_t* prev_prime,
-    uint64_t* local_best_gap, uint64_t* local_a, uint64_t* local_b
-) {
-    // Prime 2
-    if (low <= 2 && 2 <= high) {
-        if (*local_first == 0) *local_first = 2;
-        if (*prev_prime == 0) *prev_prime = 2;
-    }
+    int range = (int)(seg_high - seg_low + 1);
+    char *segment = (char *)malloc(range);
+    memset(segment, 0, range); // 0 is prime
 
-    // Only odds in [max(low,3)..high]
-    uint64_t seg_low = (low < 3) ? 3 : low;
-    if ((seg_low & 1ull) == 0) seg_low++;
-    uint64_t seg_high = high;
-    if ((seg_high & 1ull) == 0) seg_high--;
-    if (seg_low > seg_high) return;
+    for (int i = 0; i < prime_count; i++) {
+        long p = primes[i];
+        // Calculate the first multiple of p within this segment
+        long start = (seg_low + p - 1) / p * p;
+        if (start < p * p) start = p * p; // Don't cross out the prime prime itself
 
-    uint64_t n_odds = ((seg_high - seg_low) >> 1) + 1;
-    uint64_t n_bytes = (n_odds + 7) >> 3;
-    uint8_t* bits = (uint8_t*)calloc((size_t)n_bytes, 1);
-    if (!bits) { fprintf(stderr, "alloc fail\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
-
-    // Mark composites
-    for (int i = 0; i < base_count; i++) {
-        uint64_t p = (uint64_t)base[i];
-        uint64_t pp = p * p;
-        if (pp > seg_high) break;
-
-        uint64_t start = (seg_low + p - 1) / p * p;
-        if (start < pp) start = pp;
-        if ((start & 1ull) == 0) start += p; // ensure odd
-        uint64_t step = 2 * p;
-
-        for (uint64_t x = start; x <= seg_high; x += step) {
-            uint64_t idx = (x - seg_low) >> 1;
-            bs_set(bits, idx);
+        for (long j = start; j <= seg_high; j += p) {
+            segment[j - seg_low] = 1; // Mark as composite
         }
     }
 
-    // Scan primes, update gaps
-    for (uint64_t idx = 0; idx < n_odds; idx++) {
-        if (!bs_get(bits, idx)) {
-            uint64_t prime = seg_low + (idx << 1);
-
-            if (*local_first == 0) *local_first = prime;
-
-            if (*prev_prime != 0) {
-                uint64_t gap = prime - *prev_prime;
-                if (gap > *local_best_gap) {
-                    *local_best_gap = gap;
-                    *local_a = *prev_prime;
-                    *local_b = prime;
-                }
+    // Process the results of this segment
+    for (int i = 0; i < range; i++) {
+        if (!segment[i]) {
+            long curr = seg_low + i;
+            if (*first_p == -1) *first_p = curr;
+            if (*prev_p != -1) {
+                long gap = curr - *prev_p;
+                if (gap > *local_max) *local_max = gap;
             }
-            *prev_prime = prime;
+            *prev_p = curr;
+            *last_p = curr;
         }
     }
-
-    free(bits);
+    free(segment);
 }
 
-static uint64_t parse_u64(const char* s, uint64_t def) {
-    if (!s) return def;
-    char* end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (!end || *end != '\0') return def;
-    return (uint64_t)v;
-}
+// --- MAIN MPI COORDINATOR ---
+int main(int argc, char *argv[]) {
+    int id, p;
+    long n;
+    double start_time;
 
-int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &id);
+    MPI_Comm_size(MPI_COMM_WORLD, &p);
 
-    int rank = 0, size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    uint64_t N = (argc >= 2) ? parse_u64(argv[1], 1000000000ull) : 1000000000ull;
-    uint64_t W = (argc >= 3) ? parse_u64(argv[2], 100000000ull) : 100000000ull;
-    if (W < 1000) W = 1000;
-
-    if (N < 2) {
-        if (rank == 0) printf("N must be >= 2\n");
-        MPI_Finalize();
-        return 0;
+    if (argc != 2) {
+        if (id == 0) printf("Usage: %s <n>\n", argv[0]);
+        MPI_Finalize(); exit(1);
     }
-
-    // Base primes up to sqrt(N)
-    uint32_t base_limit = (uint32_t)floor(sqrt((double)N));
-    uint32_t* base = NULL;
-    int base_count = 0;
-
-    if (rank == 0) base = simple_sieve_odd(base_limit, &base_count);
-
-    MPI_Bcast(&base_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank != 0) {
-        base = (uint32_t*)malloc((size_t)base_count * sizeof(uint32_t));
-        if (!base) { fprintf(stderr, "alloc fail\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
-    }
-    MPI_Bcast(base, base_count, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
-
-    // Split [2..N] into contiguous chunks
-    uint64_t total = (N - 2) + 1;
-    uint64_t chunk = total / (uint64_t)size;
-    uint64_t rem   = total % (uint64_t)size;
-
-    uint64_t start = 2 + (uint64_t)rank * chunk + (uint64_t)((rank < (int)rem) ? rank : rem);
-    uint64_t end   = start + chunk - 1;
-    if ((uint64_t)rank < rem) end++;
+    n = atoll(argv[1]);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double t0 = MPI_Wtime();
+    start_time = MPI_Wtime();
 
-    uint64_t local_first = 0;
-    uint64_t prev_prime = 0;
-    uint64_t local_best_gap = 0, local_a = 0, local_b = 0;
+    // 1. Generate/Broadcast primes
+    int prime_count;
+    int *primes = NULL;
+    if (id == 0) primes = simple_sieve((long)sqrt((double)n), &prime_count);
 
-    for (uint64_t low = start; low <= end; ) {
-        uint64_t high = low + W - 1;
-        if (high > end) high = end;
+    MPI_Bcast(&prime_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (id != 0) primes = (int *)malloc(prime_count * sizeof(int));
+    MPI_Bcast(primes, prime_count, MPI_INT, 0, MPI_COMM_WORLD);
 
-        sieve_window_and_update(low, high, base, base_count,
-                                &local_first, &prev_prime,
-                                &local_best_gap, &local_a, &local_b);
+    // 2. Define Local Range
+    long low_bound = 2 + (long)id * (n - 1) / p;
+    long high_bound = 1 + (long)(id + 1) * (n - 1) / p;
 
-        if (high == end) break;
-        low = high + 1;
+    long local_max_gap = 0, prev_p = -1, first_p = -1, last_p = -1;
+
+    // 3. Segmented Loop
+    for (long curr_low = low_bound; curr_low <= high_bound; curr_low += SEGMENT_SIZE) {
+        long curr_high = curr_low + SEGMENT_SIZE - 1;
+        if (curr_high > high_bound) curr_high = high_bound;
+
+        sieve_segment(curr_low, curr_high, primes, prime_count,
+                      &local_max_gap, &prev_p, &first_p, &last_p);
     }
 
-    uint64_t local_last = prev_prime;
+    // 4. Consolidate Results
+    long global_max_gap = 0;
+    long *all_firsts = (id == 0) ? (long *)malloc(p * sizeof(long)) : NULL;
+    long *all_lasts  = (id == 0) ? (long *)malloc(p * sizeof(long)) : NULL;
 
-    double t1 = MPI_Wtime();
-    double local_time = t1 - t0;
-    double max_time = 0.0;
-    MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Gather(&first_p, 1, MPI_LONG_LONG, all_firsts, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Gather(&last_p, 1, MPI_LONG_LONG, all_lasts, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_max_gap, &global_max_gap, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    // Gather results
-    ull send_first = (ull)local_first;
-    ull send_last  = (ull)local_last;
-    ull send_gap   = (ull)local_best_gap;
-    ull send_p1    = (ull)local_a;
-    ull send_p2    = (ull)local_b;
-
-    ull *all_first=NULL, *all_last=NULL, *all_gap=NULL, *all_p1=NULL, *all_p2=NULL;
-    if (rank == 0) {
-        all_first = (ull*)malloc((size_t)size * sizeof(ull));
-        all_last  = (ull*)malloc((size_t)size * sizeof(ull));
-        all_gap   = (ull*)malloc((size_t)size * sizeof(ull));
-        all_p1    = (ull*)malloc((size_t)size * sizeof(ull));
-        all_p2    = (ull*)malloc((size_t)size * sizeof(ull));
-        if (!all_first||!all_last||!all_gap||!all_p1||!all_p2) {
-            fprintf(stderr, "root alloc fail\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
-
-    MPI_Gather(&send_first, 1, MPI_UNSIGNED_LONG_LONG, all_first, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-    MPI_Gather(&send_last,  1, MPI_UNSIGNED_LONG_LONG, all_last,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-    MPI_Gather(&send_gap,   1, MPI_UNSIGNED_LONG_LONG, all_gap,   1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-    MPI_Gather(&send_p1,    1, MPI_UNSIGNED_LONG_LONG, all_p1,    1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-    MPI_Gather(&send_p2,    1, MPI_UNSIGNED_LONG_LONG, all_p2,    1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-
-    if (rank == 0) {
-        ull best_gap = 0, best_a = 0, best_b = 0;
-
-        // Best within any rank
-        for (int i = 0; i < size; i++) {
-            if (all_gap[i] > best_gap) {
-                best_gap = all_gap[i];
-                best_a = all_p1[i];
-                best_b = all_p2[i];
+    if (id == 0) {
+        // Check gaps between process boundaries
+        for (int i = 0; i < p - 1; i++) {
+            if (all_lasts[i] != -1 && all_firsts[i+1] != -1) {
+                long bridge = all_firsts[i+1] - all_lasts[i];
+                if (bridge > global_max_gap) global_max_gap = bridge;
             }
         }
-        // Boundary gaps between ranks
-        for (int i = 0; i < size - 1; i++) {
-            if (all_last[i] && all_first[i + 1]) {
-                ull g = all_first[i + 1] - all_last[i];
-                if (g > best_gap) {
-                    best_gap = g;
-                    best_a = all_last[i];
-                    best_b = all_first[i + 1];
-                }
-            }
-        }
-
-        printf("N=%llu ranks=%d window=%llu\n", (ull)N, size, (ull)W);
-        printf("Largest prime gap: %llu (between %llu and %llu)\n", best_gap, best_a, best_b);
-        printf("Wall time (max over ranks): %.6f seconds\n", max_time);
-
-        free(all_first); free(all_last); free(all_gap); free(all_p1); free(all_p2);
+        printf("Result for n = %ld: Largest Gap = %ld\n", n, global_max_gap);
+        printf("Time: %f seconds using %d processes\n", MPI_Wtime() - start_time, p);
+        free(all_firsts); free(all_lasts);
     }
 
-    free(base);
+    free(primes);
     MPI_Finalize();
     return 0;
 }
