@@ -13,7 +13,35 @@ Calculate all the primes up to sqrt(n) and call them "primes"
 @author: Brandon Dang, Connor Doidge, Jackson Dow, Omar El-Baytam, Kerem Erkoc
  ***************************************************************/
 
-#define SEGMENT_SIZE 1000000 // Defined 1 million but the theory is that if its small it fits within the CPU Cache
+#define SEGMENT_SIZE 100000 // Defined 1 million but the theory is that if its small it fits within the CPU Cache
+
+typedef struct {
+    long gap;
+    long min;
+    long max;
+} GapData;
+
+/***************************************************************
+@method:
+max_gap_op
+---------------
+A type comparator for the custom GapData struct
+
+@parameter:
+in - one of the structs
+inout - the second struct that will hold the "larger" gap value.
+len -
+
+***************************************************************/
+void max_gap_op(void *in, void *inout, int *len, MPI_Datatype *dptr) {
+    GapData *inv = (GapData *)in;
+    GapData *inoutv = (GapData *)inout;
+    for (int i = 0; i < *len; i++) {
+        if (inv[i].gap > inoutv[i].gap) {
+            inoutv[i] = inv[i];
+        }
+    }
+}
 
 /***************************************************************
 @method:
@@ -82,36 +110,42 @@ last_p - last prime found
 None
  ***************************************************************/
 void sieve_segment(long seg_low, long seg_high, int *primes, int prime_count,
-                   long *local_max, long *prev_p, long *first_p, long *last_p) {
+                   GapData *local_gap, long *prev_p, long *first_p, long *last_p) {
 
     int range = (int)(seg_high - seg_low + 1);
     char *segment = (char *)malloc(range);
-    memset(segment, 0, range); // 0 is prime
+    memset(segment, 0, range);
 
+    // for every prime discovered in the simple sieve
     for (int i = 0; i < prime_count; i++) {
 
         long p = primes[i];
-        // Calculate the first multiple of p within this segment
-        long start = (seg_low + p - 1) / p * p;
 
-        if (start < p * p) start = p * p; // Don't cross out the prime prime itself
+        long start = (seg_low + p - 1) / p * p; // check if the segment value is less than p^2
+
+        if (start < p * p) start = p * p; // if so begin the sieving process.
         for (long j = start; j <= seg_high; j += p) {
 
-            segment[j - seg_low] = 1; // Mark as composite
+            segment[j - seg_low] = 1;
         }
 
     }
 
-    // Process the results of this segment
+    // for all the values calculate the first and last prime as well as find the largest gap within the range.
     for (int i = 0; i < range; i++) {
 
-        if (!segment[i]) {
+        if (!segment[i]) { // if it is a prime
 
-            long curr = seg_low + i;
+            long curr = seg_low + i; /
             if (*first_p == -1) *first_p = curr;
             if (*prev_p != -1) {
                 long gap = curr - *prev_p;
-                if (gap > *local_max) *local_max = gap;
+
+                if (gap > local_gap->gap) {
+                    local_gap->gap = gap;
+                    local_gap->min = *prev_p;
+                    local_gap->max = curr;
+                }
             }
             *prev_p = curr;
             *last_p = curr;
@@ -124,7 +158,7 @@ void sieve_segment(long seg_low, long seg_high, int *primes, int prime_count,
 
 }
 
-// --- MAIN MPI COORDINATOR ---
+// MPI main function
 int main(int argc, char *argv[]) {
     int id, p;
     long n;
@@ -138,12 +172,21 @@ int main(int argc, char *argv[]) {
         if (id == 0) printf("Usage: %s <n>\n", argv[0]);
         MPI_Finalize(); exit(1);
     }
+
+    // define the custom struct and the comparator function within MPI
+    MPI_Datatype mpi_gap_type;
+    MPI_Type_contiguous(3, MPI_LONG, &mpi_gap_type);
+    MPI_Type_commit(&mpi_gap_type);
+
+    MPI_Op mpi_op;
+    MPI_Op_create(max_gap_op, 1, &mpi_op);
+
     n = atoll(argv[1]);
 
     MPI_Barrier(MPI_COMM_WORLD);
     start_time = MPI_Wtime();
 
-    // 1. Generate/Broadcast primes
+    // send the initial primes to other processes
     int prime_count;
     int *primes = NULL;
     if (id == 0) primes = simple_sieve((long)sqrt((double)n), &prime_count);
@@ -152,13 +195,13 @@ int main(int argc, char *argv[]) {
     if (id != 0) primes = (int *)malloc(prime_count * sizeof(int));
     MPI_Bcast(primes, prime_count, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // 2. Define Local Range
+    // make ranges
     long low_bound = 2 + (long)id * (n - 1) / p;
     long high_bound = 1 + (long)(id + 1) * (n - 1) / p;
+    long prev_p = -1, first_p = -1, last_p = -1;
+    GapData local_gap = {0, 0, 0};
 
-    long local_max_gap = 0, prev_p = -1, first_p = -1, last_p = -1;
-
-    // 3. Segmented Loop
+    // loop through all segments
     for (long curr_low = low_bound; curr_low <= high_bound; curr_low += SEGMENT_SIZE) {
 
         long curr_high = curr_low + SEGMENT_SIZE - 1;
@@ -166,40 +209,47 @@ int main(int argc, char *argv[]) {
         if (curr_high > high_bound) curr_high = high_bound;
 
         sieve_segment(curr_low, curr_high, primes, prime_count,
-                      &local_max_gap, &prev_p, &first_p, &last_p);
+                      &local_gap, &prev_p, &first_p, &last_p);
 
     }
 
-    // 4. Consolidate Results
-    long global_max_gap = 0;
+    // compare all segment results and inbetweens and return the largest.
+    GapData global_gap = {0, 0, 0};
     long *all_firsts = (id == 0) ? (long *)malloc(p * sizeof(long)) : NULL;
     long *all_lasts  = (id == 0) ? (long *)malloc(p * sizeof(long)) : NULL;
 
-    MPI_Gather(&first_p, 1, MPI_LONG_LONG, all_firsts, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-    MPI_Gather(&last_p, 1, MPI_LONG_LONG, all_lasts, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_max_gap, &global_max_gap, 1, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Gather(&first_p, 1, MPI_LONG, all_firsts, 1, MPI_LONG, 0, MPI_COMM_WORLD);
+    MPI_Gather(&last_p, 1, MPI_LONG, all_lasts, 1, MPI_LONG, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_gap, &global_gap, 1, mpi_gap_type, mpi_op, 0, MPI_COMM_WORLD);
 
     if (id == 0) {
 
-        // Check gaps between process boundaries
+        // Check betweeen the segments
         for (int i = 0; i < p - 1; i++) {
 
             if (all_lasts[i] != -1 && all_firsts[i+1] != -1) {
 
                 long bridge = all_firsts[i+1] - all_lasts[i];
-                if (bridge > global_max_gap) global_max_gap = bridge;
+                if (bridge > global_gap.gap) {
+                    global_gap.gap = bridge;
+                    global_gap.max = all_firsts[i+1];
+                    global_gap.min = all_lasts[i];
+                }
 
             }
 
         }
 
-        printf("Result for n = %ld: Largest Gap = %ld\n", n, global_max_gap);
+        printf("Result for n = %ld: Largest Gap = %ld from %ld to %ld\n",
+            n, global_gap.gap, global_gap.min, global_gap.max);
         printf("Time: %f seconds using %d processes\n", MPI_Wtime() - start_time, p);
         free(all_firsts); free(all_lasts);
 
     }
 
     free(primes);
+    MPI_Type_free(&mpi_gap_type);
+    MPI_Op_free(&mpi_op);
     MPI_Finalize();
     return 0;
 
