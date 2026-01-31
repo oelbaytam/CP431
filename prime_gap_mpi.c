@@ -13,7 +13,7 @@ Calculate all the primes up to sqrt(n) and call them "primes"
 @author: Brandon Dang, Connor Doidge, Jackson Dow, Omar El-Baytam, Kerem Erkoc
  ***************************************************************/
 
-#define SEGMENT_SIZE 100000 // Defined 1 million but the theory is that if its small it fits within the CPU Cache
+#define SEGMENT_SIZE 1000000 // Defined 1 million but the theory is that if its small it fits within the CPU Cache
 
 typedef struct {
     long gap;
@@ -28,9 +28,13 @@ max_gap_op
 A type comparator for the custom GapData struct
 
 @parameter:
-in - one of the structs
-inout - the second struct that will hold the "larger" gap value.
-len -
+in - inputBuffer A pointer on the buffer providing the inputs of an
+MPI process.
+inout - outputBuffer A pointer on the buffer in which write the
+reduction results.
+len - len The number of elements on which the reduction applies. This is
+not the number of MPI processes in the communicator but the "count" argument
+passed to the reduction call.
 
 ***************************************************************/
 void max_gap_op(void *in, void *inout, int *len, MPI_Datatype *dptr) {
