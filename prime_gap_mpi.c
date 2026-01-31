@@ -140,7 +140,7 @@ void sieve_segment(long seg_low, long seg_high, int *primes, int prime_count,
 
         if (!segment[i]) { // if it is a prime
 
-            long curr = seg_low + i; /
+            long curr = seg_low + i;
             if (*first_p == -1) *first_p = curr;
             if (*prev_p != -1) {
                 long gap = curr - *prev_p;
