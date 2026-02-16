@@ -1,254 +1,174 @@
+#include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <mpi.h>
 #include <limits.h>
 
-
-#if defined(_MSC_VER)
-  #include <malloc.h>
-  #define aligned_free _aligned_free
-#else
-  #define aligned_free free
+#ifndef BLOCK_ELEMS
+#define BLOCK_ELEMS 1000000LL
 #endif
 
-// ----------- Tunables -----------
-#define ALIGN_BYTES 64
-
-#ifndef DO_GATHER_RESULT
-#define DO_GATHER_RESULT 1
-#endif
-
-#ifndef TIME_MERGE_ONLY
-#define TIME_MERGE_ONLY 1
-#endif
+// Array getters, as long as the function's are scaling in ascending
+static inline long long getA(long long i) { return 2LL * i; }
+static inline long long getB(long long i) { return 3LL * i; }
 
 
-static void *aligned_malloc(size_t bytes) {
-#if defined(_MSC_VER)
-    return _aligned_malloc(bytes, ALIGN_BYTES);
-#else
-    void *p = NULL;
-    if (posix_memalign(&p, ALIGN_BYTES, bytes) != 0) return NULL;
-    return p;
-#endif
-}
-
-static inline void sequential_merge_ptr(const int *a, int n1, const int *b, int n2, int *out) {
-    const int *pa = a, *pb = b;
-    const int *ea = a + n1, *eb = b + n2;
-    int *po = out;
-
-    while (pa < ea && pb < eb) {
-        *po++ = (*pa <= *pb) ? *pa++ : *pb++;
-    }
-
-    if (pa < ea) {
-        size_t rem = (size_t)(ea - pa);
-        memcpy(po, pa, rem * sizeof(int));
-        po += rem;
-    }
-    if (pb < eb) {
-        size_t rem = (size_t)(eb - pb);
-        memcpy(po, pb, rem * sizeof(int));
-    }
-}
-
-
-static int find_partition_safe(const int *arr1, int n1, const int *arr2, int n2, int target_pos) {
-
-    int low = (target_pos - n2 > 0) ? (target_pos - n2) : 0;
-    int high = (target_pos < n1) ? target_pos : n1;
+// find the j_r integers such that A_rk >= B_j(r)
+static long long find_partition( long long sizeA, long long sizeB, long long output_rank) {
+    long long low  = (output_rank > sizeB) ? (output_rank - sizeB) : 0;
+    long long high = (output_rank < sizeA) ? output_rank : sizeA;
 
     while (low < high) {
-        int i = low + (high - low) / 2;
-        int j = target_pos - i;
+        long long a_count = low + (high - low) / 2;
+        long long b_count = output_rank - a_count;
 
-        if (i < n1 && j > 0 && arr1[i] < arr2[j - 1]) {
-            low = i + 1;
-        } else {
-            high = i;
-        }
+        long long a_val = (a_count < sizeA) ? getA(a_count) : LLONG_MAX;
+        long long b_left = (b_count > 0) ? getB(b_count - 1) : LLONG_MIN;
+
+        if (a_val < b_left)
+            low = a_count + 1;
+        else
+            high = a_count;
     }
+
     return low;
 }
 
-int main(int argc, char *argv[]) {
-    int rank, size;
-    long long n1, n2;
 
-    if (argc < 2) {
+// -------- streaming merge with unequal bounds --------
+static void stream_merge_to_buffer(
+        long long sizeA,
+        long long sizeB,
+        long long *a_idx,
+        long long *b_idx,
+        long long *buf,
+        long long count)
+{
+    long long a = *a_idx;
+    long long b = *b_idx;
+
+    for (long long t = 0; t < count; t++) {
+        long long av = (a < sizeA) ? getA(a) : LLONG_MAX;
+        long long bv = (b < sizeB) ? getB(b) : LLONG_MAX;
+
+        if (av <= bv) { buf[t] = av; a++; }
+        else          { buf[t] = bv; b++; }
+    }
+
+    *a_idx = a;
+    *b_idx = b;
+}
+
+
+int main(int argc, char **argv)
+{
+    MPI_Init(&argc, &argv);
+
+    int rank, world_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    if (argc < 3) {
         if (rank == 0)
-            printf("Usage: mpirun -np <procs> ./Parallel_merge <num_elements_per_array>\n");
+            printf("Usage: srun -n P ./merge sizeA sizeB\n");
         MPI_Finalize();
         return 1;
     }
+    // Define the sizes of array A, B and Total
+    long long sizeA = atoll(argv[1]);
+    long long sizeB = atoll(argv[2]);
+    long long total_output = sizeA + sizeB;
 
-    n1 = atoll(argv[1]);
-    n2 = n1;   // same size for both arrays
+    // calculate the size each processor is responsible for including remainders.
+    long long base = total_output / world_size;
+    long long rem  = total_output % world_size;
 
+    // define start, end, and size for each processor
+    long long out_start = rank * base + (rank < rem ? rank : rem);
+    long long out_end = out_start + base + (rank < rem ? 1 : 0);
+    long long output_count = out_end - out_start;
 
-    int *arr1 = NULL, *arr2 = NULL, *result = NULL;
+    //
+    long long a_start = find_partition(sizeA, sizeB, out_start);
+    long long a_end   = find_partition(sizeA, sizeB, out_end);
 
-    int *s_counts1 = NULL, *displs1 = NULL;
-    int *s_counts2 = NULL, *displs2 = NULL;
-    int *recv_counts = NULL, *displs_res = NULL;
+    long long b_start = out_start - a_start;
+    long long b_end   = out_end   - a_end;
 
-    int local_n1 = 0, local_n2 = 0;
-    int *l_arr1 = NULL, *l_arr2 = NULL, *l_res = NULL;
-
-    MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    if (rank == 0) {
-        arr1 = (int *)aligned_malloc((size_t)n1 * sizeof(int));
-        arr2 = (int *)aligned_malloc((size_t)n2 * sizeof(int));
-        if (!arr1 || !arr2) {
-            fprintf(stderr, "Root: allocation failed\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        printf("Running with %lld elements per array (%lld total)\n", n1, n1 + n2);
-
-
-
-#if DO_GATHER_RESULT
-        result = (int *)aligned_malloc((size_t)(n1 + n2) * sizeof(int));
-        if (!result) {
-            fprintf(stderr, "Root: result allocation failed\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-#endif
-
-        // Generate sorted inputs
-        for (long long i = 0; i < n1; i++) arr1[i] = (int)(i * 2);
-        for (long long i = 0; i < n2; i++) arr2[i] = (int)(i * 2 + 1);
-
-        s_counts1 = (int *)malloc((size_t)size * sizeof(int));
-        displs1   = (int *)malloc((size_t)size * sizeof(int));
-        s_counts2 = (int *)malloc((size_t)size * sizeof(int));
-        displs2   = (int *)malloc((size_t)size * sizeof(int));
-        recv_counts = (int *)malloc((size_t)size * sizeof(int));
-        displs_res  = (int *)malloc((size_t)size * sizeof(int));
-
-        if (!s_counts1 || !displs1 || !s_counts2 || !displs2 || !recv_counts || !displs_res) {
-            fprintf(stderr, "Root: partition arrays allocation failed\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-
-        long long total_ll = n1 + n2;
-
-        if (total_ll / size > INT_MAX) {
-            if (rank == 0)
-                printf("Error: Each process would exceed MPI 32-bit count limit.\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-
-        int total = (int) total_ll;
-
-        const int chunk = total / size;
-        const int rem   = total % size;
-
-        for (int r = 0; r < size; r++) {
-            const int s_idx = r * chunk + (r < rem ? r : rem);
-            const int e_idx = s_idx + chunk + (r < rem ? 1 : 0);
-
-            const int p1_s = find_partition_safe(arr1, (int)n1, arr2, (int)n2, s_idx);
-            const int p1_e = find_partition_safe(arr1, (int)n1, arr2, (int)n2, e_idx);
-
-            const int p2_s = s_idx - p1_s;
-            const int p2_e = e_idx - p1_e;
-
-            s_counts1[r] = p1_e - p1_s;
-            displs1[r]   = p1_s;
-
-            s_counts2[r] = p2_e - p2_s;
-            displs2[r]   = p2_s;
-
-            recv_counts[r] = e_idx - s_idx;
-            displs_res[r]  = s_idx;
-        }
+    if ((a_end - a_start) + (b_end - b_start) != output_count) {
+        if (rank == 0) fprintf(stderr, "Partition mismatch\n");
+        MPI_Abort(MPI_COMM_WORLD, 2);
     }
 
-    MPI_Scatter(s_counts1, 1, MPI_INT, &local_n1, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Scatter(s_counts2, 1, MPI_INT, &local_n2, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    long long *merge_buffer =
+        malloc(BLOCK_ELEMS * sizeof(long long));
 
-    l_arr1 = (int *)aligned_malloc((size_t)local_n1 * sizeof(int));
-    l_arr2 = (int *)aligned_malloc((size_t)local_n2 * sizeof(int));
-    l_res  = (int *)aligned_malloc((size_t)(local_n1 + local_n2) * sizeof(int));
-
-    if ((!l_arr1 && local_n1 > 0) || (!l_arr2 && local_n2 > 0) || (!l_res && (local_n1 + local_n2) > 0)) {
-        fprintf(stderr, "Rank %d: local allocation failed\n", rank);
-        MPI_Abort(MPI_COMM_WORLD, 1);
+    if (!merge_buffer) {
+        fprintf(stderr, "Rank %d malloc failed\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 3);
     }
-
-    MPI_Scatterv(arr1, s_counts1, displs1, MPI_INT,
-                 l_arr1, local_n1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    MPI_Scatterv(arr2, s_counts2, displs2, MPI_INT,
-                 l_arr2, local_n2, MPI_INT, 0, MPI_COMM_WORLD);
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
 
-    sequential_merge_ptr(l_arr1, local_n1, l_arr2, local_n2, l_res);
+    long long a_cur = a_start;
+    long long b_cur = b_start;
+    long long produced = 0;
 
-#if TIME_MERGE_ONLY
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t1 = MPI_Wtime();
-#else
-    // You can also time end-to-end including gather below if desired.
-    double t1 = MPI_Wtime();
-#endif
+    long long first_val = 0, last_val = 0;
+    int have_data = 0;
 
-    // --- Optional gather result (expensive) ---
-#if DO_GATHER_RESULT
-    MPI_Gatherv(l_res, local_n1 + local_n2, MPI_INT,
-                result, recv_counts, displs_res, MPI_INT,
-                0, MPI_COMM_WORLD);
-#endif
+    while (produced < output_count) {
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t2 = MPI_Wtime();
+        long long chunk =
+            (output_count - produced > BLOCK_ELEMS)
+            ? BLOCK_ELEMS
+            : (output_count - produced);
 
-    if (rank == 0) {
-        if (TIME_MERGE_ONLY) {
-            printf("Parallel local-merge time (barrier-bounded): %f s\n", t1 - t0);
-        } else {
-            printf("Time after scatter (includes merge pre-gather): %f s\n", t1 - t0);
+        stream_merge_to_buffer(
+            sizeA, sizeB,
+            &a_cur, &b_cur,
+            merge_buffer,
+            chunk
+        );
+
+        if (!have_data && chunk > 0) {
+            first_val = merge_buffer[0];
+            have_data = 1;
         }
+        if (chunk > 0) last_val = merge_buffer[chunk-1];
 
-#if DO_GATHER_RESULT
-        printf("Total time incl gather (barrier-bounded): %f s\n", t2 - t0);
-        printf("Processing %lld total elements...\n", n1 + n2);
-
-        int sorted = 1;
-        for (long long i = 1; i < (n1 + n2); i++) {
-            if (result[i] < result[i - 1]) { sorted = 0; break; }
-        }
-        printf("Sorted: %s\n", sorted ? "YES" : "NO");
-#else
-        printf("Result gather skipped (DO_GATHER_RESULT=0).\n");
-#endif
+        produced += chunk;
     }
 
-    aligned_free(l_arr1);
-    aligned_free(l_arr2);
-    aligned_free(l_res);
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t1 = MPI_Wtime();
+
+    // ---- neighbor boundary check ----
+    long long prev_last = 0;
+
+    if (rank > 0)
+        MPI_Recv(&prev_last,1,MPI_LONG_LONG,rank-1,111,
+                 MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+
+    if (rank < world_size-1)
+        MPI_Send(&last_val,1,MPI_LONG_LONG,rank+1,111,
+                 MPI_COMM_WORLD);
+
+    int ok_local = !(rank>0 && have_data && prev_last>first_val);
+
+    int ok_global;
+    MPI_Reduce(&ok_local,&ok_global,1,MPI_INT,
+               MPI_MIN,0,MPI_COMM_WORLD);
 
     if (rank == 0) {
-        aligned_free(arr1);
-        aligned_free(arr2);
-#if DO_GATHER_RESULT
-        aligned_free(result);
-#endif
-        free(s_counts1); free(displs1);
-        free(s_counts2); free(displs2);
-        free(recv_counts); free(displs_res);
+        printf("sizeA=%lld sizeB=%lld total=%lld ranks=%d\n",
+               sizeA,sizeB,total_output,world_size);
+        printf("Merge time: %.6f s\n", t1-t0);
+        printf("Boundary check: %s\n",
+               ok_global?"PASS":"FAIL");
     }
 
+    free(merge_buffer);
     MPI_Finalize();
     return 0;
 }
-
-
