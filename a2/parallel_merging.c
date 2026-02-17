@@ -42,7 +42,6 @@ static long long find_partition( long long sizeA, long long sizeB, long long out
 
     return low;
 }
-}
 
 
 // merging function
