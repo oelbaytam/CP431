@@ -3,14 +3,53 @@
 #include <stdlib.h>
 #include <string.h>
 
+/***************************************************************
+CP431 Assignment 2
+---------------
+This program implements a parallel merging algorithm shown in class to merge two sorted array of numbers.
+
+@author: Brandon Dang, Connor Doidge, Jackson Dow, Omar El-Baytam, Kerem Erkoc
+ ***************************************************************/
+
 #define WRITE_OUTPUT 0   // set to 1 to write merged output to a file
 
 #define BLOCK_LENGTH 1000000LL
 
 // Array getters, as long as the function's are scaling in ascending
+/***************************************************************
+@method:
+getA
+---------------
+getter method to return value of index i in sorted array A
+Array A is defined as sorted ascending where A[i] = 2*i
+
+@parameter:
+i - index position in array
+***************************************************************/
 static inline long long getA(long long i) { return 2LL * i; }
+/***************************************************************
+@method:
+getB
+---------------
+getter method to return value of index i in sorted array B
+Array A is defined as sorted ascending where B[i] = 3*i
+
+@parameter:
+i index position in array
+***************************************************************/
 static inline long long getB(long long i) { return 3LL * i; }
 
+/***************************************************************
+@method:
+find_partition
+---------------
+function enables parallel merging by computing the correct starting partition for each MPI
+
+@parameter:
+sizeA - number of elements in array A
+sizeb - number of elements in array B
+output_rank - global merge index 
+***************************************************************/
 static long long find_partition( long long sizeA, long long sizeB, long long output_rank) {
     long long low  = (output_rank > sizeB) ? (output_rank - sizeB) : 0;
     long long high = (output_rank < sizeA) ? output_rank : sizeA;
@@ -43,8 +82,20 @@ static long long find_partition( long long sizeA, long long sizeB, long long out
     return low;
 }
 
+/***************************************************************
+@method:
+merge
+---------------
+Merge function that compares elements from array A and B inserting smaller value into buffer
 
-// merging function
+@parameter:
+sizeA - number of elements in array A
+sizeB - number of elements in array b
+*a_index - pointer to index in array A
+*b_index - pointer to index in array B
+*buf - pointer to output buffer
+count - number of elements to merge
+***************************************************************/
 static void merge(
         long long sizeA, long long sizeB,
         long long *a_index, long long *b_index,
@@ -73,7 +124,14 @@ static void merge(
     *b_index = b;
 }
 
+/***************************************************************
+@method: 
+main
+---------------
+Performs a parallel merge of two sorted arrays A and B using MPI
+(arrays are not implicitly defined)
 
+***************************************************************/
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
