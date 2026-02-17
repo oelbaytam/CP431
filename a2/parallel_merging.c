@@ -3,21 +3,21 @@
 #include <stdlib.h>
 #include <limits.h>
 
-#ifndef BLOCK_ELEMS
-#define BLOCK_ELEMS 1000000LL
-#endif
+#define WRITE_OUTPUT 0   // set to 1 to write merged output to a file
+
+#define BLOCK_LENGTH 1000000LL
+
+
 
 // Array getters, as long as the function's are scaling in ascending
 static inline long long getA(long long i) { return 2LL * i; }
 static inline long long getB(long long i) { return 3LL * i; }
 
-
-// find the j_r integers such that A_rk >= B_j(r)
 static long long find_partition( long long sizeA, long long sizeB, long long output_rank) {
-    long long low  = (output_rank > sizeB) ? (output_rank - sizeB) : 0;
-    long long high = (output_rank < sizeA) ? output_rank : sizeA;
+    long long low  = (output_rank > sizeB) ? (output_rank - sizeB) : 0; // either pick the starting value for the current partition or 0
+    long long high = (output_rank < sizeA) ? output_rank : sizeA; //
 
-    while (low < high) {
+    while (low < high) { // binary search to find partitions
         long long a_count = low + (high - low) / 2;
         long long b_count = output_rank - a_count;
 
@@ -34,28 +34,25 @@ static long long find_partition( long long sizeA, long long sizeB, long long out
 }
 
 
-// -------- streaming merge with unequal bounds --------
-static void stream_merge_to_buffer(
-        long long sizeA,
-        long long sizeB,
-        long long *a_idx,
-        long long *b_idx,
-        long long *buf,
-        long long count)
+// merging function
+static void merge(
+        long long sizeA, long long sizeB,
+        long long *a_index, long long *b_index,
+        long long *buf, long long count)
 {
-    long long a = *a_idx;
-    long long b = *b_idx;
+    long long a = *a_index;
+    long long b = *b_index;
 
     for (long long t = 0; t < count; t++) {
         long long av = (a < sizeA) ? getA(a) : LLONG_MAX;
         long long bv = (b < sizeB) ? getB(b) : LLONG_MAX;
 
         if (av <= bv) { buf[t] = av; a++; }
-        else          { buf[t] = bv; b++; }
+        else { buf[t] = bv; b++; }
     }
 
-    *a_idx = a;
-    *b_idx = b;
+    *a_index = a;
+    *b_index = b;
 }
 
 
@@ -87,88 +84,100 @@ int main(int argc, char **argv)
     long long out_end = out_start + base + (rank < rem ? 1 : 0);
     long long output_count = out_end - out_start;
 
-    //
+    // find where this rank should start and end its partition of array's a and b
     long long a_start = find_partition(sizeA, sizeB, out_start);
-    long long a_end   = find_partition(sizeA, sizeB, out_end);
-
     long long b_start = out_start - a_start;
-    long long b_end   = out_end   - a_end;
 
-    if ((a_end - a_start) + (b_end - b_start) != output_count) {
-        if (rank == 0) fprintf(stderr, "Partition mismatch\n");
-        MPI_Abort(MPI_COMM_WORLD, 2);
-    }
+    // create an array to merge each block
+    long long *merge_array = malloc(BLOCK_LENGTH * sizeof(long long));
 
-    long long *merge_buffer =
-        malloc(BLOCK_ELEMS * sizeof(long long));
-
-    if (!merge_buffer) {
-        fprintf(stderr, "Rank %d malloc failed\n", rank);
-        MPI_Abort(MPI_COMM_WORLD, 3);
-    }
+    #if WRITE_OUTPUT // create an array for the size of the output if file writing is desired.
+        long long *local_output = malloc(output_count * sizeof(long long));
+    #endif
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
 
+    // define trackers to keep track of progress in between chunks
     long long a_cur = a_start;
     long long b_cur = b_start;
     long long produced = 0;
 
+    //
     long long first_val = 0, last_val = 0;
     int have_data = 0;
 
     while (produced < output_count) {
 
-        long long chunk =
-            (output_count - produced > BLOCK_ELEMS)
-            ? BLOCK_ELEMS
-            : (output_count - produced);
+        long long chunk = (output_count - produced > BLOCK_LENGTH) ? BLOCK_LENGTH : (output_count - produced);
 
-        stream_merge_to_buffer(
+        // merges chunk by chunk where a chunk is either the BLOCK_LENGTH or the remainder of values left.
+        merge(
             sizeA, sizeB,
             &a_cur, &b_cur,
-            merge_buffer,
+            merge_array,
             chunk
         );
 
         if (!have_data && chunk > 0) {
-            first_val = merge_buffer[0];
+            first_val = merge_array[0];
             have_data = 1;
         }
-        if (chunk > 0) last_val = merge_buffer[chunk-1];
+        if (chunk > 0) last_val = merge_array[chunk-1];
 
+        // write chunk data to writing output if desired
+        #if WRITE_OUTPUT
+            memcpy(local_output + produced,
+                merge_array,
+                chunk * sizeof(long long));
+        #endif
         produced += chunk;
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     double t1 = MPI_Wtime();
 
-    // ---- neighbor boundary check ----
-    long long prev_last = 0;
-
-    if (rank > 0)
-        MPI_Recv(&prev_last,1,MPI_LONG_LONG,rank-1,111,
-                 MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-
-    if (rank < world_size-1)
-        MPI_Send(&last_val,1,MPI_LONG_LONG,rank+1,111,
-                 MPI_COMM_WORLD);
-
-    int ok_local = !(rank>0 && have_data && prev_last>first_val);
-
-    int ok_global;
-    MPI_Reduce(&ok_local,&ok_global,1,MPI_INT,
-               MPI_MIN,0,MPI_COMM_WORLD);
-
     if (rank == 0) {
         printf("sizeA=%lld sizeB=%lld total=%lld ranks=%d\n",
                sizeA,sizeB,total_output,world_size);
         printf("Merge time: %.6f s\n", t1-t0);
-        printf("Boundary check: %s\n",
-               ok_global?"PASS":"FAIL");
-    }
 
-    free(merge_buffer);
+    }
+    // write array to file if desired.
+    #if WRITE_OUTPUT
+
+        if (rank == 0) {
+            FILE *f = fopen("merged_output.bin", "wb");
+
+            // write current portion
+            fwrite(local_output, sizeof(long long), output_count, f);
+
+            // write all other portions
+            for (int r = 1; r < world_size; r++) {
+                long long count;
+                MPI_Recv(&count, 1, MPI_LONG_LONG, r, 200,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                long long *tmp = malloc(count * sizeof(long long));
+
+                MPI_Recv(tmp, count, MPI_LONG_LONG, r, 201,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                fwrite(tmp, sizeof(long long), count, f);
+                free(tmp);
+            }
+
+            fclose(f);
+            printf("Outputted to merged_output.bin\n");
+        }
+        else {
+            MPI_Send(&output_count, 1, MPI_LONG_LONG, 0, 200, MPI_COMM_WORLD);
+            MPI_Send(local_output, output_count, MPI_LONG_LONG, 0, 201, MPI_COMM_WORLD);
+        }
+
+    #endif
+
+    free(merge_array);
     MPI_Finalize();
     return 0;
 }
