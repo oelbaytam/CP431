@@ -1,36 +1,47 @@
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
+#include <string.h>
 
 #define WRITE_OUTPUT 0   // set to 1 to write merged output to a file
 
 #define BLOCK_LENGTH 1000000LL
-
-
 
 // Array getters, as long as the function's are scaling in ascending
 static inline long long getA(long long i) { return 2LL * i; }
 static inline long long getB(long long i) { return 3LL * i; }
 
 static long long find_partition( long long sizeA, long long sizeB, long long output_rank) {
-    long long low  = (output_rank > sizeB) ? (output_rank - sizeB) : 0; // either pick the starting value for the current partition or 0
-    long long high = (output_rank < sizeA) ? output_rank : sizeA; //
+    long long low  = (output_rank > sizeB) ? (output_rank - sizeB) : 0;
+    long long high = (output_rank < sizeA) ? output_rank : sizeA;
 
-    while (low < high) { // binary search to find partitions
+    while (low < high) {
         long long a_count = low + (high - low) / 2;
         long long b_count = output_rank - a_count;
 
-        long long a_val = (a_count < sizeA) ? getA(a_count) : LLONG_MAX;
-        long long b_left = (b_count > 0) ? getB(b_count - 1) : LLONG_MIN;
+        int move_right = 0;
 
-        if (a_val < b_left)
+        if (a_count >= sizeA) {
+            // A exhausted → cannot move right
+            move_right = 0;
+        } else if (b_count <= 0) {
+            // B exhausted on left → always move right
+            move_right = 0;
+        } else {
+            // Both sides valid → compare
+            long long a_val = getA(a_count);
+            long long b_left = getB(b_count - 1);
+            if (a_val < b_left) move_right = 1;
+        }
+
+        if (move_right)
             low = a_count + 1;
         else
             high = a_count;
     }
 
     return low;
+}
 }
 
 
@@ -44,11 +55,19 @@ static void merge(
     long long b = *b_index;
 
     for (long long t = 0; t < count; t++) {
-        long long av = (a < sizeA) ? getA(a) : LLONG_MAX;
-        long long bv = (b < sizeB) ? getB(b) : LLONG_MAX;
 
-        if (av <= bv) { buf[t] = av; a++; }
-        else { buf[t] = bv; b++; }
+        if (a >= sizeA) {
+            buf[t] = getB(b++);
+        }
+        else if (b >= sizeB) {
+            buf[t] = getA(a++);
+        }
+        else if (getA(a) <= getB(b)) {
+            buf[t] = getA(a++);
+        }
+        else {
+            buf[t] = getB(b++);
+        }
     }
 
     *a_index = a;
@@ -103,7 +122,6 @@ int main(int argc, char **argv)
     long long b_cur = b_start;
     long long produced = 0;
 
-    //
     long long first_val = 0, last_val = 0;
     int have_data = 0;
 
